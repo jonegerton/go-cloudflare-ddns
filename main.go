@@ -16,6 +16,18 @@ import (
 	"time"
 )
 
+//array flags
+type arrayFlags []string
+
+func (i *arrayFlags) String() string {
+	return strings.Join(*i, ",")
+}
+
+func (i *arrayFlags) Set(value string) error {
+	*i = append(*i, value)
+	return nil
+}
+
 //saveDataDocument defines the structure of the save json file
 type saveDataDocument struct {
 	IP     string `json:"ip"`
@@ -63,7 +75,7 @@ var (
 	cfuser      string
 	cfkey       string
 	cfzone      string
-	cfhost      string
+	cfhosts     arrayFlags
 	wanIPSource string = "http://icanhazip.com"
 	ipRX        *regexp.Regexp
 	savePath    string
@@ -75,7 +87,7 @@ func init() {
 	flag.StringVar(&cfuser, "cfuser", "", "Cloudflare account username")
 	flag.StringVar(&cfkey, "cfkey", "", "Global API Key from My Account > API Keys")
 	flag.StringVar(&cfzone, "cfzone", "", "Zone of the zone containing the host to update")
-	flag.StringVar(&cfhost, "cfhost", "", "Name of the host entry")
+	flag.Var(&cfhosts, "cfhost", "Names of the host entries.")
 
 	flag.BoolVar(&verbose, "verbose", false, "Enable verbose logging output")
 	flag.StringVar(&wanIPSource, "wan-ip-source", wanIPSource, "URL of WAN IP service")
@@ -113,7 +125,7 @@ func main() {
 		return
 	}
 
-	log.Print("New IP address or IP address changed - updating.")
+	log.Print("New IP address or IP address changed.")
 	saveData.IP = ip
 
 	//Get zoneid if not already resolved
@@ -126,18 +138,23 @@ func main() {
 		logVerbose("ZoneID is: %s", saveData.ZoneID)
 	}
 
-	//Always the hostData for the host record to update, as this also gets the ttl/proxied flag, which are required on the api
-	//If we cache this there's a risk of setting it to an old value
-	hostData, err := getHostData(saveData.ZoneID)
-	if err != nil {
-		log.Fatal(err)
-	}
-	logVerbose("HostID is: %s", hostData.ID)
+	for _, cfhost := range cfhosts {
 
-	//Submit to cloudflare
-	err = sendIPUpdate(hostData, saveData.ZoneID, string(ip))
-	if err != nil {
-		log.Fatal(err)
+		logVerbose("Updating IP for host: %s", cfhost)
+
+		//Always the hostData for the host record to update, as this also gets the ttl/proxied flag, which are required on the api
+		//If we cache this there's a risk of setting it to an old value
+		hostData, err := getHostData(saveData.ZoneID, cfhost)
+		if err != nil {
+			log.Fatal(err)
+		}
+		logVerbose("HostID is: %s", hostData.ID)
+
+		//Submit to cloudflare
+		err = sendIPUpdate(hostData, saveData.ZoneID, cfhost, string(ip))
+		if err != nil {
+			log.Fatal(err)
+		}
 	}
 
 	//Persist
@@ -250,7 +267,7 @@ func setSaveData(saveData saveDataDocument) (err error) {
 	return
 }
 
-func getHostData(zoneID string) (hostData hostData, err error) {
+func getHostData(zoneID string, cfhost string) (hostData hostData, err error) {
 
 	//Example curl request
 	// curl -X GET "https://api.cloudflare.com/client/v4/zones/$cfzonekey/dns_records?type=A&name=$cfhost" \
@@ -360,7 +377,7 @@ func getZoneID() (zoneID string, err error) {
 
 }
 
-func sendIPUpdate(hostData hostData, zoneID string, ip string) (err error) {
+func sendIPUpdate(hostData hostData, zoneID string, cfhost string, ip string) (err error) {
 
 	//Curl example
 	// data="{\"type\":\"A\",\"name\":\"$cfhost\",\"content\":\"$WAN_IP\",\"ttl\":$cfttl,\"proxied\":$cfproxied}"
