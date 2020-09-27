@@ -16,6 +16,12 @@ import (
 	"time"
 )
 
+//saveDataDocument defines the structure of the save json file
+type saveDataDocument struct {
+	IP     string `json:"ip"`
+	ZoneID string `json:"zoneID"`
+}
+
 //hostData is the excerpt of a larger response to return the ID only.
 //plus a couple of things that have to be echoed back when PUTting updates
 type hostData struct {
@@ -27,6 +33,13 @@ type hostData struct {
 //hostResponseMessage is the envelope response that includes the hostData
 type hostInfoResponseMessage struct {
 	Result []hostData `json:"result"`
+}
+
+//zoneInfoResponseMessage is the envelope response that includes the zone id
+type zoneInfoResponseMessage struct {
+	Result []struct {
+		ID string `json:"id"`
+	} `json:"result"`
 }
 
 // updateRequestBody is the submission body to
@@ -49,20 +62,22 @@ type updateResponseMessage struct {
 var (
 	cfuser      string
 	cfkey       string
-	cfzonekey   string
+	cfzone      string
 	cfhost      string
 	wanIPSource string = "http://icanhazip.com"
 	ipRX        *regexp.Regexp
 	savePath    string
+	verbose     bool
 )
 
 func init() {
 
 	flag.StringVar(&cfuser, "cfuser", "", "Cloudflare account username")
 	flag.StringVar(&cfkey, "cfkey", "", "Global API Key from My Account > API Keys")
-	flag.StringVar(&cfzonekey, "cfzonekey", "", "Zone ID from zone overview page")
+	flag.StringVar(&cfzone, "cfzone", "", "Zone of the zone containing the host to update")
 	flag.StringVar(&cfhost, "cfhost", "", "Name of the host entry")
 
+	flag.BoolVar(&verbose, "verbose", false, "Enable verbose logging output")
 	flag.StringVar(&wanIPSource, "wan-ip-source", wanIPSource, "URL of WAN IP service")
 
 	ipRX = regexp.MustCompile(`\b(?:\d{1,3}\.){3}\d{1,3}\b`)
@@ -71,7 +86,7 @@ func init() {
 	if err != nil {
 		log.Fatal(fmt.Errorf("Failed to get working directory: %v", err))
 	}
-	savePath = path.Join(pwd, "go-cloudflare-ddns-saved-ip.txt")
+	savePath = path.Join(pwd, "go-cloudflare-ddns-saved.json")
 
 }
 
@@ -84,45 +99,68 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("WAN IP is: %s", string(ip))
+	logVerbose("WAN IP is: %s", ip)
 
-	//check for saved IP
-	savedIP, err := ioutil.ReadFile(savePath)
+	//Get saved data
+	saveData, err := getSaveData()
 	if err != nil {
-		log.Printf("Could not read saved ip from file '%v' (this is ok on first run. at other times check file permissions etc)", savePath)
+		log.Fatal(err)
 	}
 
 	//Verify work is needed
-	if bytes.Compare(ip, savedIP) == 0 {
-		log.Printf("IP address unchanged - nothing to do.")
+	if strings.Compare(ip, saveData.IP) == 0 {
+		log.Print("IP address unchanged - nothing to do.")
 		return
 	}
-	log.Print("IP address changed - updating.")
 
-	//Get the ID for the host record to update
-	hostData, err := getHostData()
+	log.Print("New IP address or IP address changed - updating.")
+	saveData.IP = ip
+
+	//Get zoneid if not already resolved
+	if saveData.ZoneID == "" {
+		logVerbose("Getting zoneid for zone: %s", cfzone)
+		saveData.ZoneID, err = getZoneID()
+		if err != nil {
+			log.Fatal(err)
+		}
+		logVerbose("ZoneID is: %s", saveData.ZoneID)
+	}
+
+	//Always the hostData for the host record to update, as this also gets the ttl/proxied flag, which are required on the api
+	//If we cache this there's a risk of setting it to an old value
+	hostData, err := getHostData(saveData.ZoneID)
 	if err != nil {
 		log.Fatal(err)
 	}
+	logVerbose("HostID is: %s", hostData.ID)
 
 	//Submit to cloudflare
-	err = sendIPUpdate(hostData, string(ip))
+	err = sendIPUpdate(hostData, saveData.ZoneID, string(ip))
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	//Persist the IP only once upload has succeeded (incase retry is required)
-	if err = ioutil.WriteFile(savePath, ip, 0644); err != nil {
-		log.Fatalf("Failed to save ip address to file at '%v'", savePath)
+	//Persist
+	err = setSaveData(saveData)
+	if err != nil {
+		log.Fatal(err)
 	}
 
 	log.Print("IP address update complete.")
 
 }
 
-func getWANIP() (ip []byte, err error) {
+func logVerbose(format string, a ...interface{}) {
+	if !verbose {
+		return
+	}
 
-	ip = nil
+	log.Printf(format, a...)
+}
+
+func getWANIP() (ip string, err error) {
+
+	ip = ""
 	err = nil
 
 	defer func() {
@@ -152,20 +190,67 @@ func getWANIP() (ip []byte, err error) {
 	}
 	defer resp.Body.Close()
 
-	ip, err = ioutil.ReadAll(resp.Body)
+	data, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		return
 	}
 
-	if !ipRX.Match(ip) {
+	ip = strings.TrimSpace(string(data))
+
+	if !ipRX.MatchString(ip) {
 		err = fmt.Errorf("Response from %v does not look like an IP address: %.25s", wanIPSource, ip)
 	}
 
 	return
+}
+
+func getSaveData() (saveData saveDataDocument, err error) {
+
+	defer func() {
+		if err != nil {
+			err = fmt.Errorf("Error in getSavedData(): %v", err)
+		}
+	}()
+
+	//check for saved data
+	data, readErr := ioutil.ReadFile(savePath)
+	if readErr != nil {
+		log.Printf("Could not read saved data from file '%v' (this is ok on first run. at other times check file permissions etc)", savePath)
+		return
+	}
+
+	if err = json.Unmarshal(data, &saveData); err != nil {
+		err = fmt.Errorf("Error parsing host details response: %v", err)
+		return
+	}
+	return
 
 }
 
-func getHostData() (hostData hostData, err error) {
+func setSaveData(saveData saveDataDocument) (err error) {
+
+	defer func() {
+		if err != nil {
+			err = fmt.Errorf("Error in setSaveData(): %v", err)
+
+		}
+	}()
+
+	data, err := json.Marshal(saveData)
+	if err != nil {
+		err = fmt.Errorf("Error preparsing saveData: %v", err)
+		return
+	}
+
+	//Persist the IP only once upload has succeeded (incase retry is required)
+	if err = ioutil.WriteFile(savePath, data, 0644); err != nil {
+		log.Fatalf("Failed to save data to file at '%v'", savePath)
+	}
+
+	return
+}
+
+func getHostData(zoneID string) (hostData hostData, err error) {
 
 	//Example curl request
 	// curl -X GET "https://api.cloudflare.com/client/v4/zones/$cfzonekey/dns_records?type=A&name=$cfhost" \
@@ -175,11 +260,11 @@ func getHostData() (hostData hostData, err error) {
 
 	defer func() {
 		if err != nil {
-			err = fmt.Errorf("Error in getHostID(): %v", err)
+			err = fmt.Errorf("Error in getHostData(): %v", err)
 		}
 	}()
 
-	url := fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s/dns_records?type=A&name=%s", cfzonekey, cfhost)
+	url := fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s/dns_records?type=A&name=%s", zoneID, cfhost)
 
 	req, _ := http.NewRequest("GET", url, nil)
 	req.Header.Set("X-Auth-Key", cfkey)
@@ -220,7 +305,62 @@ func getHostData() (hostData hostData, err error) {
 
 }
 
-func sendIPUpdate(hostData hostData, ip string) (err error) {
+func getZoneID() (zoneID string, err error) {
+
+	//Example curl request
+	// curl -X GET "https://api.cloudflare.com/client/v4/zones/?name=$cfhost" \
+	// 	-H "X-Auth-Key: $cfkey " \
+	// 	-H "X-Auth-Email: $cfuser" \
+	// 	-H "Content-Type: application/json" > ./cf-ddns.json
+
+	defer func() {
+		if err != nil {
+			err = fmt.Errorf("Error in getZoneID(): %v", err)
+		}
+	}()
+
+	url := fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/?name=%s", cfzone)
+
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("X-Auth-Key", cfkey)
+	req.Header.Set("X-Auth-Email", cfuser)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{
+		Timeout: time.Second * 10,
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return
+	}
+	if resp == nil {
+		err = fmt.Errorf("Error requesting zone details %v", url)
+		return
+	}
+	defer resp.Body.Close()
+
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return
+	}
+
+	var msg zoneInfoResponseMessage
+	if err = json.Unmarshal(body, &msg); err != nil {
+		err = fmt.Errorf("Error parsing zone details response: %v", err)
+		return
+	}
+	if len(msg.Result) == 0 || msg.Result[0].ID == "" {
+		err = fmt.Errorf("Error reading zone id")
+		return
+	}
+	zoneID = msg.Result[0].ID
+
+	return
+
+}
+
+func sendIPUpdate(hostData hostData, zoneID string, ip string) (err error) {
 
 	//Curl example
 	// data="{\"type\":\"A\",\"name\":\"$cfhost\",\"content\":\"$WAN_IP\",\"ttl\":$cfttl,\"proxied\":$cfproxied}"
@@ -250,7 +390,7 @@ func sendIPUpdate(hostData hostData, ip string) (err error) {
 		err = fmt.Errorf("Error in sendIPUpdate(): %v", err)
 	}
 
-	url := fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s/dns_records/%s", cfzonekey, hostData.ID)
+	url := fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s/dns_records/%s", zoneID, hostData.ID)
 
 	req, _ := http.NewRequest("PUT", url, bytes.NewBuffer(putBody))
 	req.Header.Set("X-Auth-Key", cfkey)
@@ -287,7 +427,7 @@ func sendIPUpdate(hostData hostData, ip string) (err error) {
 	}
 
 	//Check IP on response matches submit
-	if strings.Compare(ip, msg.Result.Content) == 0 {
+	if strings.Compare(ip, msg.Result.Content) != 0 {
 		err = errors.New("Error checking that IP was correctly updated")
 		return
 	}
