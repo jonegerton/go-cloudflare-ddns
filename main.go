@@ -84,10 +84,10 @@ var (
 
 func init() {
 
-	flag.StringVar(&cfuser, "cfuser", "", "Cloudflare account username")
-	flag.StringVar(&cfkey, "cfkey", "", "Global API Key from My Account > API Keys")
-	flag.StringVar(&cfzone, "cfzone", "", "Zone of the zone containing the host to update")
-	flag.Var(&cfhosts, "cfhost", "Names of the host entries.")
+	flag.StringVar(&cfuser, "cfuser", "", "Cloudflare account username (required)")
+	flag.StringVar(&cfkey, "cfkey", "", "Global API Key from My Account > API Keys (required)")
+	flag.StringVar(&cfzone, "cfzone", "", "Name of the zone containing the host to update (required)")
+	flag.Var(&cfhosts, "cfhost", "Names of the host entries (required)")
 
 	flag.BoolVar(&verbose, "verbose", false, "Enable verbose logging output")
 	flag.StringVar(&wanIPSource, "wan-ip-source", wanIPSource, "URL of WAN IP service")
@@ -105,6 +105,13 @@ func init() {
 func main() {
 
 	flag.Parse()
+
+	//Check mandatory flags
+	if cfuser == "" || cfkey == "" || cfzone == "" || len(cfhosts) == 0 {
+		flag.Usage()
+		os.Exit(1)
+		return
+	}
 
 	//Get the WAN IP
 	ip, err := getWANIP()
