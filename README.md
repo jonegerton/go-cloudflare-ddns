@@ -6,6 +6,15 @@ This is a golang implementation of my [sh script version](https://github.com/jon
 
 This utility is working as at 28-Sep-2020. Changes to the api by CloudFlare will likely break them.
 
+## Releases
+
+Get the latest release here: https://github.com/jonegerton/go-cloudflare-ddns/releases/latest.
+Binaries are provided for:
+
+- Linux on Arm
+- Linux on x64
+- Windows on x64
+
 ## Flags
 
 - cfuser: Cloudflare account username (required)
